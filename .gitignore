@@ -1,0 +1,26 @@
+# CCS build directories
+Debug/
+Release/
+
+# CCS metadata
+.metadata/
+*.launch
+
+# Build outputs
+*.out
+*.map
+*.hex
+*.bin
+
+# Object files
+*.o
+*.obj
+*.d
+
+# Autosave / backup
+*~
+*.bak
+
+# OS junk
+.DS_Store
+Thumbs.db
