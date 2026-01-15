@@ -14,13 +14,11 @@
 // - Can change x_offset / column count later if we want faster updates.
 // -----------------------------------------------------------------------------
 
-typedef uint8_t  u8;
-typedef uint16_t u16;
 
 // ---------------- Pin mapping ----------------
-#define OLED_SCL_BIT   BIT1   // P2.1
+#define OLED_SCL_BIT   BIT6   // P2.6
 #define OLED_SDA_BIT   BIT2   // P2.2
-#define OLED_RES_BIT   BIT0   // P2.0
+#define OLED_RES_BIT   BIT5   // P2.5
 
 #define OLED_PORT_DIR  P2DIR
 #define OLED_PORT_OUT  P2OUT
@@ -39,6 +37,17 @@ typedef uint16_t u16;
 
 #define OLED_CMD   0
 #define OLED_DATA  1
+
+// UART
+#define BUFFER_SIZE 500
+#define PACKET_SIZE 14 // bytes
+#define START_BYTE 255
+
+volatile unsigned char uartBuffer[BUFFER_SIZE]; // circular buffer
+volatile unsigned int head = 0;  // index for next write
+volatile unsigned int tail = 0;  // index for next read
+volatile unsigned int count = 0; // number of bytes in buffer
+volatile unsigned int packets = 0; // number of packets to be processed
 
 // -----------------------------------------------------------------------------
 // Font + bitmap tables (copied from sample.c, with minor type changes)
@@ -349,6 +358,17 @@ static const uint8_t pic3[]=
 0x0F,0x02,0x02,0x00,0x02,0x0F,0x08,0x04,0x03,0x00,0x0F,0x00,0x8F,0x88,0x8E,0xE0,
 };
 
+// 12x16 arrow head, page-major (2 pages × 12 columns)
+const unsigned char arrow_head_right_12x16[24] = {
+  0x08,0x14,0x24,0x48,0x88,0x10,0x10,0x20,0x20,0x40,0x40,0x80,
+  0x08,0x14,0x12,0x09,0x08,0x04,0x04,0x02,0x02,0x01,0x01,0x00
+};
+
+const unsigned char arrow_head_left_12x16[24] = {
+  0x80,0x40,0x40,0x20,0x20,0x10,0x10,0x88,0x48,0x24,0x14,0x08,
+  0x00,0x01,0x01,0x02,0x02,0x04,0x04,0x08,0x09,0x12,0x14,0x08
+};
+
 // -----------------------------------------------------------------------------
 // Delay helpers (conservative / slow, fine for bring-up)
 // -----------------------------------------------------------------------------
@@ -554,21 +574,21 @@ static void oled_reset_pulse(void)
 // -----------------------------------------------------------------------------
 
 // x_offset matches the sample code (module-specific column mapping)
-static u8 x_offset = 0x02;
+static uint8_t x_offset = 0x22;
 
-void OLED_WR_Byte(u8 dat, u8 mode)
+void OLED_WR_Byte(uint8_t dat, uint8_t mode)
 {
     if (mode == OLED_DATA) (void)oled_data(dat);
     else                  (void)oled_cmd(dat);
 }
 
-void OLED_ColorTurn(u8 i)
+void OLED_ColorTurn(uint8_t i)
 {
     if (i == 0) OLED_WR_Byte(0xA6, OLED_CMD); // normal
     if (i == 1) OLED_WR_Byte(0xA7, OLED_CMD); // inverse
 }
 
-void OLED_DisplayTurn(u8 i)
+void OLED_DisplayTurn(uint8_t i)
 {
     if (i == 0)
     {
@@ -582,11 +602,14 @@ void OLED_DisplayTurn(u8 i)
     }
 }
 
-void OLED_Set_Pos(u8 x, u8 y)
+void OLED_Set_Pos(uint8_t x, uint8_t y)
 {
+    
+    uint8_t col = x + x_offset; 
+
     OLED_WR_Byte(0xB0 + y, OLED_CMD);
-    OLED_WR_Byte((((x & 0xF0) >> 4) | 0x10) + x_offset, OLED_CMD);
-    OLED_WR_Byte((x & 0x0F) + x_offset, OLED_CMD);
+    OLED_WR_Byte(0x10 | (col >> 4), OLED_CMD);
+    OLED_WR_Byte(col & 0x0F, OLED_CMD);
 }
 
 void OLED_Display_On(void)
@@ -608,15 +631,16 @@ void OLED_Clear(void)
     // Use a small zero buffer and stream it repeatedly.
     static const uint8_t zeros[16] = {0};
 
-    u8 page;
+    uint8_t page;
     for (page = 0; page < 4; page++)
     {
         OLED_WR_Byte(0xB0 + page, OLED_CMD);
-        OLED_WR_Byte(0x00 + x_offset, OLED_CMD);
-        OLED_WR_Byte(0x10 + x_offset, OLED_CMD);
+        uint8_t col = x_offset;
+        OLED_WR_Byte(col & 0x0F, OLED_CMD);
+        OLED_WR_Byte(0x10 | (col >> 4), OLED_CMD);
 
         // Sample code clears 128 columns per page
-        u8 n; 
+        uint8_t n; 
         for (n = 0; n < 8; n++)
         {
             (void)oled_write_data_bytes(zeros, sizeof(zeros)); // 8*16 = 128 bytes
@@ -625,10 +649,10 @@ void OLED_Clear(void)
 }
 
 
-void OLED_ShowChar(u8 x, u8 y, u8 chr, u8 sizey)
+void OLED_ShowChar(uint8_t x, uint8_t y, uint8_t chr, uint8_t sizey)
 {
-    u8 c = 0, sizex = sizey / 2;
-    u16 i = 0, size1;
+    uint8_t c = 0, sizex = sizey / 2;
+    uint16_t i = 0, size1;
 
     if (sizey == 8) size1 = 6;
     else size1 = (sizey / 8 + ((sizey % 8) ? 1 : 0)) * (sizey / 2);
@@ -645,17 +669,17 @@ void OLED_ShowChar(u8 x, u8 y, u8 chr, u8 sizey)
     }
 }
 
-u16 oled_pow(u8 m, u8 n)
+uint16_t oled_pow(uint8_t m, uint8_t n)
 {
-    u16 result = 1;
+    uint16_t result = 1;
     while (n--) result *= m;
     return result;
 }
 
-void OLED_ShowNum(u8 x, u8 y, u16 num, u8 len, u8 sizey)
+void OLED_ShowNum(uint8_t x, uint8_t y, uint16_t num, uint8_t len, uint8_t sizey)
 {
-    u8 t, temp, m = 0;
-    u8 enshow = 0;
+    uint8_t t, temp, m = 0;
+    uint8_t enshow = 0;
 
     if (sizey == 8) m = 2;
 
@@ -675,9 +699,9 @@ void OLED_ShowNum(u8 x, u8 y, u16 num, u8 len, u8 sizey)
     }
 }
 
-void OLED_ShowString(u8 x, u8 y, const u8 *chr, u8 sizey)
+void OLED_ShowString(uint8_t x, uint8_t y, const uint8_t *chr, uint8_t sizey)
 {
-    u8 j = 0;
+    uint8_t j = 0;
     while (chr[j] != '\0')
     {
         OLED_ShowChar(x, y, chr[j++], sizey);
@@ -686,9 +710,9 @@ void OLED_ShowString(u8 x, u8 y, const u8 *chr, u8 sizey)
     }
 }
 
-void OLED_ShowChinese(u8 x, u8 y, u8 no, u8 sizey)
+void OLED_ShowChinese(uint8_t x, uint8_t y, uint8_t no, uint8_t sizey)
 {
-    u16 i, size1 = (sizey / 8 + ((sizey % 8) ? 1 : 0)) * sizey;
+    uint16_t i, size1 = (sizey / 8 + ((sizey % 8) ? 1 : 0)) * sizey;
     for (i = 0; i < size1; i++)
     {
         if (i % sizey == 0) OLED_Set_Pos(x, y++);
@@ -697,10 +721,10 @@ void OLED_ShowChinese(u8 x, u8 y, u8 no, u8 sizey)
     }
 }
 
-void OLED_DrawBMP(u8 x, u8 y, u8 sizex, u8 sizey, const u8 *BMP)
+void OLED_DrawBMP(uint8_t x, uint8_t y, uint8_t sizex, uint8_t sizey, const uint8_t *BMP)
 {
-    u16 j = 0;
-    u8 i, m;
+    uint16_t j = 0;
+    uint8_t i, m;
 
     sizey = sizey / 8 + ((sizey % 8) ? 1 : 0);
     for (i = 0; i < sizey; i++)
@@ -752,26 +776,284 @@ static void clock_init_dco_default(void)
 {
     CSCTL0_H = CSKEY_H;
     //CSCTL1 |= DCORSEL;
-    CSCTL1 = DCOFSEL_0;  // ~5.33 MHz on MSP430FR5739
-    //CSCTL1 = DCOFSEL0 + DCOFSEL1; // 8 MHz
+    //CSCTL1 = DCOFSEL_0;  // ~5.33 MHz on MSP430FR5739
+    CSCTL1 = DCOFSEL0 + DCOFSEL1; // 8 MHz
     CSCTL2 = SELA__VLOCLK | SELS__DCOCLK | SELM__DCOCLK;
     CSCTL3 = DIVA__1 | DIVS__1 | DIVM__1;
     CSCTL0_H = 0;
+}
+
+void uart_setup() {
+    // Configure ports for UART
+	P2SEL0 &= ~(BIT0 + BIT1);
+	P2SEL1 |= BIT0 + BIT1;
+
+	// Configure UART0
+	UCA0CTLW0 |= UCSWRST;
+    //UCA0CTLW0 |= UCSSEL0;                   // Run the UART using ACLK
+    UCA0CTLW0 |= UCSSEL1;                   // Run the UART using SMCLK
+	UCA0MCTLW = UCOS16 + UCBRF0 + 0x4900;   // Baud rate = 9600 from an 8 MHz clock
+	UCA0BRW = 52;
+	UCA0CTLW0 &= ~UCSWRST;
+    
+	UCA0IE |= UCRXIE;                       // Enable UART Rx interrupt
+}
+
+void sendUARTChar(unsigned char c)
+{
+    while(!(UCA0IFG & UCTXIFG)) UCA0TXBUF=c;
+}
+
+void sendUARTString(const char *str)
+{
+    while(*str) sendUARTChar(*str++);
+}
+
+void sendUARTInt(unsigned int value)
+{
+    char buf[6]; int i=0;
+    if(value==0){ sendUARTChar('0'); return; }
+    while(value>0){ buf[i++]=(value%10)+'0'; value/=10; }
+    while(i-->0) sendUARTChar(buf[i]);
+}
+
+// ====== Helpers ======	
+static void unpack_two_digits(uint8_t b, uint8_t *tensChar, uint8_t *onesChar)
+{
+    uint8_t tens = (uint8_t)(b / 10);
+    uint8_t ones = (uint8_t)(b % 10);
+
+    if (tens > 9) tens = 0;
+    if (ones > 9) ones = 0;
+
+    *tensChar = '0' + tens;
+    *onesChar = '0' + ones;
+}
+
+// Writes unsigned integer v (0..999) into out with no leading zeros.
+// Returns number of chars written (no null terminator).
+static int utoa_no_leading_zeros(unsigned int v, uint8_t *out)
+{
+    if (v == 0) { out[0] = '0'; return 1; }
+
+    uint8_t tmp[5];
+    int n = 0;
+    while (v > 0 && n < 4)
+    {
+        tmp[n++] = '0' + (v % 10);
+        v /= 10;
+    }
+    int i;
+    for (i = 0; i < n; i++)
+        out[i] = tmp[n - 1 - i];
+
+    return n;
+}
+
+// out must be big enough (recommend >= 16)
+static void build_distance_string(uint8_t dist1, uint8_t dist2, uint8_t unit01, uint8_t *out)
+{
+    int idx = 0;
+
+    if (unit01 == 0)
+    {
+        // -------- METERS --------
+        // dist1: thousands/hundreds, dist2: tens/ones (two digits per byte)
+        uint8_t d0, d1, d2, d3;
+        unpack_two_digits(dist1, &d0, &d1);
+        unpack_two_digits(dist2, &d2, &d3);
+
+        uint8_t digits[4] = { d0, d1, d2, d3 };
+
+        // Strip leading zeros, keep at least one digit
+        int started = 0;
+        int i;
+        for (i = 0; i < 4; i++)
+        {
+            if (!started)
+            {
+                if (digits[i] != '0' || i == 3) started = 1;
+                else continue;
+            }
+            out[idx++] = digits[i];
+        }
+
+        out[idx++] = ' ';
+        out[idx++] = 'm';
+        out[idx]   = '\0';
+        return;
+    }
+    else if (unit01 == 1)
+    {
+        // -------- KILOMETERS --------
+        // dist1: integer km part (0..254)
+        // dist2: decimals
+        idx += utoa_no_leading_zeros(dist1, &out[idx]);
+
+        uint8_t tenths = 0;
+        uint8_t hundredths = 0;
+
+        if (dist2 < 10)
+        {
+            tenths = dist2;      // 5 => .5
+            hundredths = 0;
+        }
+        else
+        {
+            tenths = (uint8_t)(dist2 / 10);     // 55 => 5
+            hundredths = (uint8_t)(dist2 % 10); // 55 => 5
+        }
+
+        if (!(tenths == 0 && hundredths == 0))
+        {
+            out[idx++] = '.';
+            out[idx++] = '0' + (tenths % 10);
+            if (hundredths != 0) // trim trailing zero
+                out[idx++] = '0' + (hundredths % 10);
+        }
+
+        out[idx++] = ' ';
+        out[idx++] = 'k';
+        out[idx++] = 'm';
+        out[idx]   = '\0';
+        return;
+    }
+    else
+    {
+        // Unknown unit
+        out[0] = '?';
+        out[1] = '\0';
+    }
+}
+
+// out must be >= 9 (8 chars + null)
+static void build_street_string(const uint8_t *streetBytes8, uint8_t *out)
+{
+    int idx = 0;
+    int i;
+    for (i = 0; i < 8; i++)
+    {
+        uint8_t c = streetBytes8[i];
+        if (c == 0) break;           // treat 0 as terminator
+        out[idx++] = c;
+    }
+    out[idx] = '\0';
 }
 
 int main(void) {
     WDTCTL = WDTPW | WDTHOLD;
 
     P3DIR |= BIT4; // LED to check ack
-    P3OUT &= !BIT4; 
+    P3OUT &= ~BIT4; 
 
 
     clock_init_dco_default();
+    uart_setup();
     delay_ms(200);
 
     OLED_Init();
-    
+
+    __enable_interrupt();       // Enable global interrupts
+
+    OLED_ShowString(0,0,"Welcome",8);
+    OLED_ShowString(0,1,"to",8);
+    OLED_ShowString(0,2,"EYEWHERE",8);
+    //OLED_ShowString(0,3,"",8);
+
+    // preallocated strings
+    uint8_t distanceString[16];
+    uint8_t streetString[9];
+
     while (1) {
-        
+        if (packets > 0) {
+            if (uartBuffer[tail] == START_BYTE)
+            {
+                unsigned int index = tail;
+                tail = (tail + 1) % BUFFER_SIZE;
+
+                // direction arrow
+                uint8_t dir = uartBuffer[tail]; // 1 is left 2 is right
+                tail = (tail + 1) % BUFFER_SIZE;
+
+                // distance bytes + unit
+                uint8_t dist1 = uartBuffer[tail];
+                tail = (tail + 1) % BUFFER_SIZE;
+                uint8_t dist2 = uartBuffer[tail];
+                tail = (tail + 1) % BUFFER_SIZE;
+                uint8_t unit  = uartBuffer[tail]; // 0=m, 1=km
+                tail = (tail + 1) % BUFFER_SIZE;
+
+                // street name bytes (8)
+                uint8_t streetBytes[8];
+                int i;
+                for (i = 0; i < 8; i++) {
+                    streetBytes[i] = uartBuffer[tail];
+                    tail = (tail + 1) % BUFFER_SIZE;
+                }
+
+                // special message
+                uint8_t special = uartBuffer[tail];
+                tail = (tail + 1) % BUFFER_SIZE;
+
+                // create strings
+                build_distance_string(dist1, dist2, unit, distanceString);
+                build_street_string(streetBytes, streetString);
+
+                // ---- Now you would call your OLED functions (not implemented here) ----
+                // Example placeholders:
+                // OLED_DrawArrow(dir);
+                // OLED_DrawString_Page(2, /*x*/0, distanceString);
+                // OLED_DrawString_Page(3, /*x*/0, streetString);
+                // OLED_HandleSpecial(special);
+
+
+                OLED_Clear();
+                if (dir == 1) {
+                    //OLED_ShowString(0,0,"Left",8);
+                    OLED_DrawBMP(0,0,12,16,arrow_head_left_12x16);
+                }
+                else {
+                    //OLED_ShowString(0,0,"Right",8);
+                    OLED_DrawBMP(0,0,12,16,arrow_head_right_12x16);
+                }
+
+                OLED_ShowString(0,2,distanceString,8);
+                OLED_ShowString(0,3,streetString,8);
+
+                //(void)dir;
+                //(void)special;
+
+                // echo packet back for debugging
+                for (i = 0; i < PACKET_SIZE; i++)
+
+                    sendUARTChar(uartBuffer[(index+i)%BUFFER_SIZE]);
+            }
+            packets--;
+            count -= PACKET_SIZE;
+        } 
+    }
+}
+
+#pragma vector = USCI_A0_VECTOR
+__interrupt void USCI_A0_ISR(void)
+{
+    switch (__even_in_range(UCA0IV, 4))
+    {
+    case 0: break;                 // No interrupt
+    case 2:                        // RXIFG
+        {
+            unsigned int rx = UCA0RXBUF;   // Read received byte
+            uartBuffer[head] = rx;
+            head = (head + 1) % BUFFER_SIZE;
+            if (count < BUFFER_SIZE) count++; // otherwise overflow
+
+            if (count >= PACKET_SIZE) {
+                packets = count / PACKET_SIZE;
+            }
+
+        }
+        break;
+    case 4: break;                 // TXIFG (not used)
+    default: break;
     }
 }
